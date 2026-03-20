@@ -22,7 +22,7 @@ The idea: give an AI agent a small but real LLM training setup and let it experi
 
 The repo is deliberately kept small and only really has a three files that matter:
 
-- **`prepare.py`** — fixed constants, one-time data prep (downloads TinyStories data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation).
+- **`prepare.py`** — fixed constants, one-time data prep (downloads data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation).
 - **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
 - **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
 
@@ -34,7 +34,7 @@ By design, training runs for a **fixed 5-minute time budget** (wall clock, exclu
 
 - Single runtime path uses PyTorch SDPA attention and eager execution (no FA3/`torch.compile` fast path).
 - Native Windows support targets desktop consumer GPUs with a tiered VRAM policy (Turing >=8 GB, Ampere/Ada/Blackwell >=10 GB), official PyTorch CUDA wheels, and SDPA attention.
-- Default dataset is now TinyStories GPT-4 clean for practical consumer-GPU setup.
+- Default dataset is `ultrafineweb` (CrowdMind/ultrafineweb_dolma_shuffled). A `tinystories` profile is also available.
 
 ```powershell
 
@@ -45,7 +45,7 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 uv sync
 
 # 3. Download data and train tokenizer (one-time)
-#    Default dataset: TinyStories GPT-4 clean
+#    Default dataset: ultrafineweb (use --dataset tinystories for the smaller profile)
 uv run prepare.py
 
 # 4. Manually run a single training experiment (~5 min)
@@ -102,9 +102,19 @@ This fork's platform policy is explicit and tiered.
 - Runtime adaptation is profile-driven: compute capability, BF16/TF32 support, OS, and VRAM tier determine candidate batch sizes and checkpointing strategy.
 - Supported consumer profiles run a short eager-mode autotune pass and cache the selected candidate per GPU/runtime fingerprint.
 - Autotune env controls: `AUTORESEARCH_DISABLE_AUTOTUNE=1` skips probing; `AUTORESEARCH_AUTOTUNE_REFRESH=1` refreshes the cached decision.
-- Tested hardware in this repo remains RTX 3080 10 GB on Windows. Other listed SKUs are matrix-supported but may be less field-tested here.
+- Tested hardware in this repo: RTX 3080 10 GB on Windows (upstream), RTX 4060 Ti 16 GB on Windows (this fork). Other listed SKUs are matrix-supported but may be less field-tested here.
 - Non-goals for this fork include FA3/H100-specialized paths, unofficial Triton-for-Windows stacks, AMD/ROCm, Apple Metal, and multi-GPU training.
-- Default dataset is `karpathy/tinystories_gpt4_clean` for consumer-GPU practicality.
+- Default dataset is `ultrafineweb` (CrowdMind/ultrafineweb_dolma_shuffled). The `tinystories` profile (karpathy/tinystories_gpt4_clean) is also available.
+
+## Baseline
+
+Baseline results on `ultrafineweb` (30-minute time budget):
+
+| GPU | VRAM | Arch | Params | tok/sec | MFU | Model config |
+| --- | --- | --- | --- | --- | --- | --- |
+| RTX 4060 Ti | 16 GB | Ada (8.9) | 75.5M | ~34,010 | 10.2% | 8L, 4H, 512d, SDPA, BF16 |
+
+Configuration: `batch_size=4`, activation checkpointing on, head_dim=128, window pattern SSSL. Autotune-selected via eager-mode probe. The 75.5M-parameter model uses value embeddings (33.6M of the total) and Muon+AdamW optimizer.
 
 ## License
 
