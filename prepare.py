@@ -42,8 +42,8 @@ BOS_TOKEN = "<|reserved_0|>"
 # Dataset + cache configuration
 # ---------------------------------------------------------------------------
 
-DEFAULT_DATASET = "tinystories"
-DATASET_CHOICES = ("tinystories",)
+DEFAULT_DATASET = "ultrafineweb"
+DATASET_CHOICES = ("ultrafineweb", "tinystories")
 
 
 def _default_cache_dir():
@@ -69,6 +69,15 @@ DATASETS_DIR = os.path.join(CACHE_DIR, "datasets")
 ACTIVE_DATASET_PATH = os.path.join(CACHE_DIR, "active_dataset.txt")
 
 DATASET_CONFIGS = {
+    "ultrafineweb": {
+        "filename": "ultrafineweb_0.parquet",
+        "url": "https://huggingface.co/api/datasets/CrowdMind/ultrafineweb_dolma_shuffled/parquet/default/train/0.parquet",
+        "splits": {
+            "test": (0, 10_000),
+            "val": (10_000, 20_000),
+            "train": (20_000, None),
+        },
+    },
     "tinystories": {
         "filename": "tinystories_gpt4_clean.parquet",
         "url": "https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean/resolve/main/tinystories_gpt4_clean.parquet",
@@ -188,25 +197,24 @@ def _resolve_tiny_parquet_for_read(dataset_name=None):
 
 
 # ---------------------------------------------------------------------------
-# Data download (TinyStories only)
+# Data download
 # ---------------------------------------------------------------------------
 
 
-def _download_tinystories_file(dataset_name):
+def _download_parquet_file(dataset_name):
     config = DATASET_CONFIGS[dataset_name]
     data_dir = _data_dir(dataset_name)
     os.makedirs(data_dir, exist_ok=True)
 
     filename = config["filename"]
     filepath = os.path.join(data_dir, filename)
-    resolved_existing_path = _resolve_tiny_parquet_for_read(dataset_name)
-    if os.path.exists(resolved_existing_path):
-        print(f"Data: {filename} already downloaded at {resolved_existing_path}")
+    if os.path.exists(filepath):
+        print(f"Data: {filename} already downloaded at {filepath}")
         return
 
     url = config["url"]
     print(f"Data: downloading {filename}...")
-    response = requests.get(url, stream=True, timeout=60)
+    response = requests.get(url, stream=True, timeout=120)
     response.raise_for_status()
     temp_path = filepath + ".tmp"
     with open(temp_path, "wb") as f:
@@ -219,7 +227,7 @@ def _download_tinystories_file(dataset_name):
 
 def download_data(dataset_name):
     dataset = _resolve_dataset_name(dataset_name)
-    _download_tinystories_file(dataset)
+    _download_parquet_file(dataset)
 
 
 # ---------------------------------------------------------------------------
@@ -246,37 +254,38 @@ def list_parquet_files(dataset_name=None):
     return []
 
 
-def _iter_tinystories_texts(split, dataset_name=None):
+def _iter_texts(split, dataset_name=None):
     dataset = _resolve_dataset_name(dataset_name)
     config = DATASET_CONFIGS[dataset]
     start_idx, end_idx = config["splits"][split]
-    tiny_path = _resolve_tiny_parquet_for_read(dataset)
 
-    if not os.path.exists(tiny_path):
+    parquet_files = list_parquet_files(dataset)
+    if not parquet_files:
         raise FileNotFoundError(
-            f"TinyStories parquet not found at {tiny_path}. Run prepare.py first."
+            f"No parquet files found for dataset '{dataset}'. Run prepare.py first."
         )
 
     current_idx = 0
-    parquet_file = pq.ParquetFile(tiny_path)
-    for row_group_idx in range(parquet_file.num_row_groups):
-        row_group = parquet_file.read_row_group(row_group_idx, columns=["text"])
-        texts = row_group.column("text").to_pylist()
-        for text in texts:
-            if current_idx < start_idx:
+    for parquet_path in parquet_files:
+        parquet_file = pq.ParquetFile(parquet_path)
+        for row_group_idx in range(parquet_file.num_row_groups):
+            row_group = parquet_file.read_row_group(row_group_idx, columns=["text"])
+            texts = row_group.column("text").to_pylist()
+            for text in texts:
+                if current_idx < start_idx:
+                    current_idx += 1
+                    continue
+                if end_idx is not None and current_idx >= end_idx:
+                    return
+                yield text
                 current_idx += 1
-                continue
-            if end_idx is not None and current_idx >= end_idx:
-                return
-            yield text
-            current_idx += 1
 
 
 def text_iterator(dataset_name=None, max_chars=1_000_000_000, doc_cap=10_000):
     dataset = _resolve_dataset_name(dataset_name)
     chars = 0
 
-    text_iter = _iter_tinystories_texts("train", dataset_name=dataset)
+    text_iter = _iter_texts("train", dataset_name=dataset)
     for text in text_iter:
         doc = text[:doc_cap] if len(text) > doc_cap else text
         chars += len(doc)
@@ -299,8 +308,10 @@ def train_tokenizer(dataset_name=None):
 
     parquet_files = list_parquet_files(dataset)
     if len(parquet_files) < 1:
-        print("Tokenizer: TinyStories parquet is missing. Run prepare.py first.")
-        raise RuntimeError("TinyStories parquet is missing.")
+        print(
+            f"Tokenizer: parquet data is missing for '{dataset}'. Run prepare.py first."
+        )
+        raise RuntimeError(f"Parquet data is missing for '{dataset}'.")
 
     print(f"Tokenizer: training BPE tokenizer ({dataset})...")
     t0 = time.time()
@@ -419,7 +430,7 @@ def _document_batches(split, dataset=None, tokenizer_batch_size=128):
     epoch = 1
     while True:
         batch = []
-        for text in _iter_tinystories_texts(split, dataset_name=dataset_name):
+        for text in _iter_texts(split, dataset_name=dataset_name):
             batch.append(text)
             if len(batch) >= tokenizer_batch_size:
                 yield batch, epoch
@@ -439,8 +450,6 @@ def make_dataloader(
     100% utilization (no padding).
     """
     dataset_name = _resolve_dataset_name(dataset or getattr(tokenizer, "dataset", None))
-    if split == "test":
-        assert dataset_name == "tinystories", "Test split exists only for TinyStories."
     assert split in ("train", "val", "test")
 
     row_capacity = T + 1
@@ -566,7 +575,7 @@ if __name__ == "__main__":
         default=None,
         help=(
             "Dataset profile to prepare. If omitted, resolves in order: "
-            "AUTORESEARCH_DATASET, active_dataset.txt, then default tinystories."
+            "AUTORESEARCH_DATASET, active_dataset.txt, then default ultrafineweb."
         ),
     )
     args = parser.parse_args()
