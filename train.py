@@ -335,6 +335,7 @@ class GPTConfig:
     compute_dtype: torch.dtype = torch.bfloat16
     n_experts: int = 0
     top_k: int = 2
+    n_shared_experts: int = 0
     aux_loss_weight: float = 0.01
 
 
@@ -448,6 +449,7 @@ class MoELayer(nn.Module):
         self.top_k = config.top_k
         self.n_embd = config.n_embd
         self.expert_dim = config.n_embd
+        self.n_shared = getattr(config, "n_shared_experts", 0)
         self.router = nn.Linear(config.n_embd, config.n_experts, bias=False)
         self.w1 = nn.Parameter(
             torch.empty(config.n_experts, config.n_embd, self.expert_dim)
@@ -455,6 +457,16 @@ class MoELayer(nn.Module):
         self.w2 = nn.Parameter(
             torch.empty(config.n_experts, self.expert_dim, config.n_embd)
         )
+        if self.n_shared > 0:
+            self.sw1 = nn.Parameter(
+                torch.empty(self.n_shared, config.n_embd, self.expert_dim)
+            )
+            self.sw2 = nn.Parameter(
+                torch.empty(self.n_shared, self.expert_dim, config.n_embd)
+            )
+            s = 3**0.5 * config.n_embd**-0.5
+            nn.init.uniform_(self.sw1, -s, s)
+            nn.init.zeros_(self.sw2)
         nn.init.normal_(self.router.weight, mean=0.0, std=0.01)
         s = 3**0.5 * config.n_embd**-0.5
         nn.init.uniform_(self.w1, -s, s)
@@ -524,6 +536,15 @@ class MoELayer(nn.Module):
         out_buf.scatter_add_(0, valid_toks.unsqueeze(-1).expand(-1, C), combined)
 
         out = out_buf.reshape(B, T, C)
+
+        if self.n_shared > 0:
+            flat_x2 = x.reshape(B * T, C)
+            for i in range(self.n_shared):
+                h = flat_x2 @ self.sw1[i]
+                h = F.relu(h).square()
+                h = h @ self.sw2[i]
+                out = out + h.reshape(B, T, C)
+
         return out, balance_loss
 
 
@@ -1018,6 +1039,7 @@ WINDOW_PATTERN = "SSSL"  # sliding window pattern: L=full, S=half context
 # MoE
 N_EXPERTS = 4  # 0 = dense MLP, >0 = MoE with this many experts
 TOP_K = 2
+N_SHARED_EXPERTS = 0  # shared experts processed by every token
 AUX_LOSS_WEIGHT = 0.01
 
 # Optimization
@@ -1059,6 +1081,7 @@ def build_model_config(depth, vocab_size, runtime, use_activation_checkpointing=
         compute_dtype=runtime.amp_dtype,
         n_experts=N_EXPERTS,
         top_k=TOP_K,
+        n_shared_experts=N_SHARED_EXPERTS,
         aux_loss_weight=AUX_LOSS_WEIGHT,
     )
 
