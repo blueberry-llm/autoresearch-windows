@@ -22,11 +22,11 @@ The idea: give an AI agent a small but real LLM training setup and let it experi
 
 The repo is deliberately kept small and only really has a three files that matter:
 
-- **`prepare.py`** — fixed constants, one-time data prep (downloads TinyStories data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation).
-- **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
+- **`prepare.py`** — fixed constants, one-time data prep (downloads data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation).
+- **`train.py`** — the single file the agent edits. Contains a Mixture-of-Experts (MoE) GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, expert count, etc. **This file is edited and iterated on by the agent**.
 - **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
 
-By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
+By design, training runs for a **fixed 40-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
 
 ## Quick start (PowerShell)
 
@@ -34,7 +34,8 @@ By design, training runs for a **fixed 5-minute time budget** (wall clock, exclu
 
 - Single runtime path uses PyTorch SDPA attention and eager execution (no FA3/`torch.compile` fast path).
 - Native Windows support targets desktop consumer GPUs with a tiered VRAM policy (Turing >=8 GB, Ampere/Ada/Blackwell >=10 GB), official PyTorch CUDA wheels, and SDPA attention.
-- Default dataset is now TinyStories GPT-4 clean for practical consumer-GPU setup.
+- Default dataset is `ultrafineweb` (CrowdMind/ultrafineweb_dolma_shuffled).
+- Current architecture: Mixture-of-Experts (MoE) with 4 experts, top-2 routing, and load balancing loss.
 
 ```powershell
 
@@ -45,10 +46,10 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 uv sync
 
 # 3. Download data and train tokenizer (one-time)
-#    Default dataset: TinyStories GPT-4 clean
+#    Default dataset: ultrafineweb
 uv run prepare.py
 
-# 4. Manually run a single training experiment (~5 min)
+# 4. Manually run a single training experiment (~40 min)
 uv run train.py
 ```
 
@@ -82,7 +83,8 @@ pyproject.toml  — dependencies
 ## Design choices
 
 - **Single file to modify.** The agent only touches `train.py`. This keeps the scope manageable and diffs reviewable.
-- **Fixed time budget.** Training always runs for exactly 5 minutes, regardless of your specific platform. This means you can expect approx 12 experiments/hour and approx 100 experiments while you sleep. There are two upsides of this design decision. First, this makes experiments directly comparable regardless of what the agent changes (model size, batch size, architecture, etc). Second, this means that autoresearch will find the most optimal model for your platform in that time budget. The downside is that your runs (and results) become not comparable to other people running on other compute platforms.
+- **Fixed time budget.** Training always runs for exactly 40 minutes, regardless of your specific platform. This means you can expect approx 1-2 experiments/hour. There are two upsides of this design decision. First, this makes experiments directly comparable regardless of what the agent changes (model size, batch size, architecture, etc). Second, this means that autoresearch will find the most optimal model for your platform in that time budget. The downside is that your runs (and results) become not comparable to other people running on other compute platforms.
+- **MoE architecture.** The current model uses a Mixture-of-Experts design with 4 experts per layer and top-2 routing. Each expert has the same hidden dimension as the embedding size. This gives the model more total capacity while keeping per-token compute manageable.
 - **Self-contained.** No external dependencies beyond PyTorch and a few small packages. No distributed training, no complex configs. One GPU, one file, one metric.
 
 ## Platform support
@@ -105,6 +107,17 @@ This fork's platform policy is explicit and tiered.
 - Tested hardware in this repo remains RTX 3080 10 GB on Windows. Other listed SKUs are matrix-supported but may be less field-tested here.
 - Non-goals for this fork include FA3/H100-specialized paths, unofficial Triton-for-Windows stacks, AMD/ROCm, Apple Metal, and multi-GPU training.
 - Default dataset is `karpathy/tinystories_gpt4_clean` for consumer-GPU practicality.
+
+## Baseline
+
+MoE baseline on `ultrafineweb` (40-minute time budget, RTX 4060 Ti 16 GB):
+
+| Config | val_bpb | Params | Steps | VRAM | Notes |
+| --- | --- | --- | --- | --- | --- |
+| MoE AR=32, batch=4 | **1.330** | 31.5M | 329 | 3.3 GB | **Current best MoE** |
+| Dense AR=64, batch=16 | 1.271 | 75.5M | 127 | 9.5 GB | Dense baseline (pre-MoE) |
+
+The MoE model uses 4 experts with top-2 routing. ASPECT_RATIO=32 gives n_embd=256 with 4 heads. The smaller model trains more steps in the fixed time budget, which more than compensates for reduced per-step capacity.
 
 ## License
 
