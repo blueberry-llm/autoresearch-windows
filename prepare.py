@@ -73,9 +73,9 @@ DATASET_CONFIGS = {
         "filename": "ultrafineweb_0.parquet",
         "url": "https://huggingface.co/api/datasets/CrowdMind/ultrafineweb_dolma_shuffled/parquet/default/train/0.parquet",
         "splits": {
-            "test": (0, 10_000),
-            "val": (10_000, 20_000),
-            "train": (20_000, None),
+            "test": (0, 2_000),
+            "val": (2_000, 4_000),
+            "train": (4_000, None),
         },
     },
     "tinystories": {

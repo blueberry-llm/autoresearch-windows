@@ -333,6 +333,9 @@ class GPTConfig:
     attention_backend: str = "sdpa"
     use_activation_checkpointing: bool = False
     compute_dtype: torch.dtype = torch.bfloat16
+    n_experts: int = 0
+    top_k: int = 2
+    aux_loss_weight: float = 0.01
 
 
 def norm(x):
@@ -438,16 +441,111 @@ class MLP(nn.Module):
         return x
 
 
+class MoELayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.n_experts = config.n_experts
+        self.top_k = config.top_k
+        self.n_embd = config.n_embd
+        self.expert_dim = config.n_embd
+        self.router = nn.Linear(config.n_embd, config.n_experts, bias=False)
+        self.w1 = nn.Parameter(
+            torch.empty(config.n_experts, config.n_embd, self.expert_dim)
+        )
+        self.w2 = nn.Parameter(
+            torch.empty(config.n_experts, self.expert_dim, config.n_embd)
+        )
+        nn.init.normal_(self.router.weight, mean=0.0, std=0.01)
+        s = 3**0.5 * config.n_embd**-0.5
+        nn.init.uniform_(self.w1, -s, s)
+        nn.init.zeros_(self.w2)
+
+    def forward(self, x):
+        B, T, C = x.size()
+        N = B * T
+        router_logits = self.router(x)
+        router_probs = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+        topk_w, topk_idx = torch.topk(router_probs, self.top_k, dim=-1)
+        topk_w = topk_w / topk_w.sum(dim=-1, keepdim=True)
+
+        flat_idx = topk_idx.reshape(N, self.top_k)
+        flat_w = topk_w.reshape(N, self.top_k).to(x.dtype)
+        flat_x = x.reshape(N, C)
+
+        tokens_per_expert = torch.zeros(self.n_experts, device=x.device)
+        ones = torch.ones(N, self.top_k, device=x.device)
+        tokens_per_expert.scatter_add_(0, flat_idx.reshape(-1), ones.reshape(-1))
+        balance_loss = (
+            self.n_experts * (tokens_per_expert / tokens_per_expert.sum()).pow(2).sum()
+        )
+
+        all_idx = flat_idx.reshape(-1)
+        all_w = flat_w.reshape(-1)
+        tok_ids = (
+            torch.arange(N, device=x.device)
+            .unsqueeze(1)
+            .expand(-1, self.top_k)
+            .reshape(-1)
+        )
+
+        sorted_idx = all_idx.argsort()
+        sorted_tok = tok_ids[sorted_idx]
+        sorted_w = all_w[sorted_idx]
+
+        counts = tokens_per_expert.long()
+        dispatched_x = flat_x[sorted_tok]
+        dispatched_w = sorted_w
+
+        splits = counts.tolist()
+        x_chunks = dispatched_x.split(splits)
+        w_chunks = dispatched_w.split(splits)
+
+        out_chunks = []
+        for e in range(self.n_experts):
+            if splits[e] == 0:
+                continue
+            h = x_chunks[e] @ self.w1[e]
+            h = F.relu(h).square()
+            h = h @ self.w2[e]
+            out_chunks.append(h * w_chunks[e].unsqueeze(-1))
+
+        out_buf = torch.zeros(N, C, device=x.device, dtype=x.dtype)
+        valid_toks = sorted_tok[
+            torch.cat(
+                [
+                    torch.arange(c, device=x.device)
+                    + (counts[:e].sum().item() if e > 0 else 0)
+                    for e, c in enumerate(splits)
+                    if c > 0
+                ]
+            ).long()
+        ]
+        combined = torch.cat(out_chunks, dim=0)
+        out_buf.scatter_add_(0, valid_toks.unsqueeze(-1).expand(-1, C), combined)
+
+        out = out_buf.reshape(B, T, C)
+        return out, balance_loss
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.use_moe = config.n_experts > 0
+        if self.use_moe:
+            self.moe = MoELayer(config)
+        else:
+            self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size):
         x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
-        return x
+        if self.use_moe:
+            moe_out, aux_loss = self.moe(norm(x))
+            x = x + moe_out
+            return x, aux_loss
+        else:
+            x = x + self.mlp(norm(x))
+            return x, torch.tensor(0.0, device=x.device)
 
 
 class GPT(nn.Module):
@@ -491,8 +589,13 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if not block.use_moe:
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            else:
+                torch.nn.init.zeros_(block.moe.w2)
+                torch.nn.init.uniform_(block.moe.w1, -s, s)
+                torch.nn.init.normal_(block.moe.router.weight, mean=0.0, std=0.01)
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
         for ve in self.value_embeds.values():
@@ -584,7 +687,9 @@ class GPT(nn.Module):
         scalar_lr=0.5,
     ):
         model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
+        all_transformer_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in all_transformer_params if p.ndim == 2]
+        higher_dim_params = [p for p in all_transformer_params if p.ndim > 2]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -592,6 +697,7 @@ class GPT(nn.Module):
         x0_params = [self.x0_lambdas]
         assert len(list(self.parameters())) == (
             len(matrix_params)
+            + len(higher_dim_params)
             + len(embedding_params)
             + len(lm_head_params)
             + len(value_embeds_params)
@@ -642,6 +748,17 @@ class GPT(nn.Module):
                 weight_decay=0.0,
             ),
         ]
+        if higher_dim_params:
+            param_groups.append(
+                dict(
+                    kind="adamw",
+                    params=higher_dim_params,
+                    lr=matrix_lr * dmodel_lr_scale,
+                    betas=adam_betas,
+                    eps=1e-10,
+                    weight_decay=weight_decay,
+                )
+            )
         muon_group_chunk = 8
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -671,16 +788,19 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)
         x = norm(x)
         x0 = x
+        total_aux_loss = 0.0
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             window_size = self.window_sizes[i]
             if self.config.use_activation_checkpointing:
-                x = torch_checkpoint(
+                result = torch_checkpoint(
                     block, x, ve, cos_sin, window_size, use_reentrant=False
                 )
+                x, aux_loss = result
             else:
-                x = block(x, ve, cos_sin, window_size)
+                x, aux_loss = block(x, ve, cos_sin, window_size)
+            total_aux_loss = total_aux_loss + aux_loss
         x = norm(x)
 
         softcap = 15
@@ -694,6 +814,11 @@ class GPT(nn.Module):
                 ignore_index=-1,
                 reduction=reduction,
             )
+            if self.config.n_experts > 0:
+                loss = (
+                    loss
+                    + self.config.aux_loss_weight * total_aux_loss / self.config.n_layer
+                )
             return loss
         return logits
 
@@ -715,10 +840,11 @@ def adamw_step_fused(
     p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t
 ):
     p.mul_(1 - lr_t * wd_t)
-    # Keep moments in their own dtype (float32 for fp16 params) to avoid grad^2 underflow.
     g = grad.to(exp_avg.dtype)
-    exp_avg.lerp_(g, 1 - beta1_t)
-    exp_avg_sq.lerp_(g.square(), 1 - beta2_t)
+    b1 = beta1_t.to(exp_avg.dtype)
+    b2 = beta2_t.to(exp_avg.dtype)
+    exp_avg.mul_(b1).add_(g, alpha=(1 - b1).item())
+    exp_avg_sq.mul_(b2).add_(g.square(), alpha=(1 - b2).item())
     bias1 = 1 - beta1_t**step_t
     bias2 = 1 - beta2_t**step_t
     denom = (exp_avg_sq / bias2).sqrt() + eps_t
@@ -889,6 +1015,11 @@ ASPECT_RATIO = 64  # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128  # target head dimension for attention
 WINDOW_PATTERN = "SSSL"  # sliding window pattern: L=full, S=half context
 
+# MoE
+N_EXPERTS = 4  # 0 = dense MLP, >0 = MoE with this many experts
+TOP_K = 2
+AUX_LOSS_WEIGHT = 0.01
+
 # Optimization
 TOTAL_BATCH_SIZE = 2**19
 EMBEDDING_LR = 0.6
@@ -910,6 +1041,8 @@ EVAL_BATCH_SIZE = 8
 def build_model_config(depth, vocab_size, runtime, use_activation_checkpointing=None):
     if use_activation_checkpointing is None:
         use_activation_checkpointing = runtime.use_activation_checkpointing
+    if N_EXPERTS > 0:
+        use_activation_checkpointing = False
     base_dim = depth * ASPECT_RATIO
     model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
     num_heads = model_dim // HEAD_DIM
@@ -924,6 +1057,9 @@ def build_model_config(depth, vocab_size, runtime, use_activation_checkpointing=
         attention_backend=runtime.attention_backend,
         use_activation_checkpointing=use_activation_checkpointing,
         compute_dtype=runtime.amp_dtype,
+        n_experts=N_EXPERTS,
+        top_k=TOP_K,
+        aux_loss_weight=AUX_LOSS_WEIGHT,
     )
 
 
