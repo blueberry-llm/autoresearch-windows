@@ -688,7 +688,9 @@ class GPT(nn.Module):
         scalar_lr=0.5,
     ):
         model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
+        all_transformer_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in all_transformer_params if p.ndim == 2]
+        higher_dim_params = [p for p in all_transformer_params if p.ndim > 2]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -696,6 +698,7 @@ class GPT(nn.Module):
         x0_params = [self.x0_lambdas]
         assert len(list(self.parameters())) == (
             len(matrix_params)
+            + len(higher_dim_params)
             + len(embedding_params)
             + len(lm_head_params)
             + len(value_embeds_params)
@@ -746,6 +749,17 @@ class GPT(nn.Module):
                 weight_decay=0.0,
             ),
         ]
+        if higher_dim_params:
+            param_groups.append(
+                dict(
+                    kind="adamw",
+                    params=higher_dim_params,
+                    lr=matrix_lr * dmodel_lr_scale,
+                    betas=adam_betas,
+                    eps=1e-10,
+                    weight_decay=weight_decay,
+                )
+            )
         muon_group_chunk = 8
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -827,10 +841,11 @@ def adamw_step_fused(
     p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t
 ):
     p.mul_(1 - lr_t * wd_t)
-    # Keep moments in their own dtype (float32 for fp16 params) to avoid grad^2 underflow.
     g = grad.to(exp_avg.dtype)
-    exp_avg.lerp_(g, 1 - beta1_t)
-    exp_avg_sq.lerp_(g.square(), 1 - beta2_t)
+    b1 = beta1_t.to(exp_avg.dtype)
+    b2 = beta2_t.to(exp_avg.dtype)
+    exp_avg.mul_(b1).add_(g, alpha=(1 - b1).item())
+    exp_avg_sq.mul_(b2).add_(g.square(), alpha=(1 - b2).item())
     bias1 = 1 - beta1_t**step_t
     bias2 = 1 - beta2_t**step_t
     denom = (exp_avg_sq / bias2).sqrt() + eps_t
