@@ -28,7 +28,7 @@ import torch
 # ---------------------------------------------------------------------------
 
 MAX_SEQ_LEN = 2048  # context length
-TIME_BUDGET = 1800  # training time budget in seconds (30 minutes)
+TIME_BUDGET = 2400  # training time budget in seconds (40 minutes)
 EVAL_TOKENS = 40 * 524288  # number of tokens for validation eval
 VOCAB_SIZE = 16384
 
