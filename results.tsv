@@ -2,3 +2,4 @@ commit	val_bpb	memory_gb	status	description
 6b4e29f	1.302671	3.0	keep	baseline: 75.5M params, 8L 4H 512d, batch=4, ckpt=on, ultrafineweb
 b9c0748	1.536281	4.3	discard	depth 8→12 (185.6M params, fewer tokens seen: 35M vs 67M)
 41a6fb7	1.286344	9.5	keep	disable autotune, batch=16 (better gradient estimates, still fits VRAM)
+74815bd	1.368681	9.5	discard	LR warmup 0→0.1, warmdown 0.5→0.3 (worse, warmup wastes steps)
