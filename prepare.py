@@ -393,6 +393,7 @@ class Tokenizer:
         return self.bos_token_id
 
     def encode(self, text, prepend=None, num_threads=8):
+        prepend_id: int | None = None
         if prepend is not None:
             prepend_id = (
                 prepend
@@ -401,11 +402,11 @@ class Tokenizer:
             )
         if isinstance(text, str):
             ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
+            if prepend_id is not None:
                 ids.insert(0, prepend_id)
         elif isinstance(text, list):
             ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
+            if prepend_id is not None:
                 for row in ids:
                     row.insert(0, prepend_id)
         else:
@@ -515,7 +516,7 @@ def make_dataloader(
 
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
-        if use_cuda:
+        if use_cuda and gpu_buffer is not None:
             gpu_buffer.copy_(cpu_buffer, non_blocking=True)
         yield inputs, targets, epoch
 
