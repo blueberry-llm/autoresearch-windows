@@ -462,42 +462,69 @@ class MoELayer(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size()
+        N = B * T
         router_logits = self.router(x)
         router_probs = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
-        topk_weights, topk_indices = torch.topk(router_probs, self.top_k, dim=-1)
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        topk_weights = topk_weights.to(x.dtype)
+        topk_w, topk_idx = torch.topk(router_probs, self.top_k, dim=-1)
+        topk_w = topk_w / topk_w.sum(dim=-1, keepdim=True)
 
-        flat_x = x.reshape(B * T, C)
-        flat_idx = topk_indices.reshape(B * T, self.top_k)
-        flat_w = topk_weights.reshape(B * T, self.top_k)
+        flat_idx = topk_idx.reshape(N, self.top_k)
+        flat_w = topk_w.reshape(N, self.top_k).to(x.dtype)
+        flat_x = x.reshape(N, C)
 
         tokens_per_expert = torch.zeros(self.n_experts, device=x.device)
-        for k in range(self.top_k):
-            for e in range(self.n_experts):
-                tokens_per_expert[e] += (flat_idx[:, k] == e).sum()
+        ones = torch.ones(N, self.top_k, device=x.device)
+        tokens_per_expert.scatter_add_(0, flat_idx.reshape(-1), ones.reshape(-1))
         balance_loss = (
             self.n_experts * (tokens_per_expert / tokens_per_expert.sum()).pow(2).sum()
         )
 
-        out = torch.zeros_like(flat_x)
+        all_idx = flat_idx.reshape(-1)
+        all_w = flat_w.reshape(-1)
+        tok_ids = (
+            torch.arange(N, device=x.device)
+            .unsqueeze(1)
+            .expand(-1, self.top_k)
+            .reshape(-1)
+        )
+
+        sorted_idx = all_idx.argsort()
+        sorted_tok = tok_ids[sorted_idx]
+        sorted_w = all_w[sorted_idx]
+
+        counts = tokens_per_expert.long()
+        dispatched_x = flat_x[sorted_tok]
+        dispatched_w = sorted_w
+
+        splits = counts.tolist()
+        x_chunks = dispatched_x.split(splits)
+        w_chunks = dispatched_w.split(splits)
+
+        out_chunks = []
         for e in range(self.n_experts):
-            mask = flat_idx == e
-            if not mask.any():
+            if splits[e] == 0:
                 continue
-            which_tok, which_k = mask.nonzero(as_tuple=True)
-            unique_toks = which_tok.unique()
-            x_e = flat_x[unique_toks]
-            h = x_e @ self.w1[e]
+            h = x_chunks[e] @ self.w1[e]
             h = F.relu(h).square()
             h = h @ self.w2[e]
-            w_per_tok = torch.zeros(len(unique_toks), device=x.device, dtype=x.dtype)
-            for i, (t, k) in enumerate(zip(which_tok.tolist(), which_k.tolist())):
-                loc = (unique_toks == t).nonzero(as_tuple=True)[0].item()
-                w_per_tok[loc] += flat_w[t, k]
-            out[unique_toks] += h * w_per_tok.unsqueeze(-1)
+            out_chunks.append(h * w_chunks[e].unsqueeze(-1))
 
-        out = out.reshape(B, T, C)
+        out_buf = torch.zeros(N, C, device=x.device, dtype=x.dtype)
+        valid = counts > 0
+        valid_toks = sorted_tok[
+            torch.cat(
+                [
+                    torch.arange(c, device=x.device)
+                    + (counts[:e].sum().item() if e > 0 else 0)
+                    for e, c in enumerate(splits)
+                    if c > 0
+                ]
+            ).long()
+        ]
+        combined = torch.cat(out_chunks, dim=0)
+        out_buf.scatter_add_(0, valid_toks.unsqueeze(-1).expand(-1, C), combined)
+
+        out = out_buf.reshape(B, T, C)
         return out, balance_loss
 
 
