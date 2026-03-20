@@ -5,3 +5,4 @@ b9c0748	1.536281	4.3	discard	depth 8→12 (185.6M params, fewer tokens seen: 35M
 74815bd	1.368681	9.5	discard	LR warmup 0→0.1, warmdown 0.5→0.3 (worse, warmup wastes steps)
 77c572e	1.280021	9.5	keep	matrix LR 0.04→0.06 (Muon tolerates higher LR)
 5d93417	1.270597	9.5	keep	matrix LR 0.06→0.08
+9c7021c	1.279071	9.5	discard	matrix LR 0.08→0.10 (past sweet spot, diverging)
