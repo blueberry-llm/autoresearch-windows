@@ -160,7 +160,7 @@ def _resolve_gpu_profile(gpu_name, capability, gpu_vram_gb, is_windows):
                 name=f"{arch}-16gb",
                 is_supported_consumer=True,
                 is_compatibility_only=False,
-                train_batch_candidates=(32, 16, 8, 4),
+                train_batch_candidates=(16, 8),
                 checkpoint_modes=(False, True),
                 default_checkpointing=False,
             )
