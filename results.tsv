@@ -1,2 +1,3 @@
 commit	val_bpb	memory_gb	status	description
 6b4e29f	1.302671	3.0	keep	baseline: 75.5M params, 8L 4H 512d, batch=4, ckpt=on, ultrafineweb
+b9c0748	1.536281	4.3	discard	depth 8→12 (185.6M params, fewer tokens seen: 35M vs 67M)
