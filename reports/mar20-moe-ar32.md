@@ -24,4 +24,4 @@ This approaches the dense baseline val_bpb (1.271) — within 0.06. The remainin
 
 ## Outcome
 
-**Keep.** Best MoE configuration so far. This is the current MoE baseline.
+**Keep as baseline.** This config (4 experts, top-2, AR=32) is the reference. It has been surpassed by **top_k=1** (1.320) and **top_k=3** (1.320). Updated best MoE config is **top_k=1** at 1.320 — now the daily branch default.
