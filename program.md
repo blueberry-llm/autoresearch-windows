@@ -2,6 +2,45 @@
 
 This is an experiment to optimize a Mixture-of-Experts (MoE) model using autonomous AI research.
 
+## Status (2026-03-21 end-of-day)
+
+**Current best: val_bpb=1.306817** (experiment `mar21-auxloss2`, commit `6bc3ba8`)
+
+**Best config (branch `autoresearch/mar21`):**
+- ASPECT_RATIO=32 (n_embd=256, 31.5M params)
+- N_EXPERTS=4, TOP_K=3, AUX_LOSS_WEIGHT=0.0001
+- MATRIX_LR=0.08, WEIGHT_DECAY=0.2
+- batch_size=4, depth=8
+
+**Today's experiments completed:**
+| Commit | val_bpb | Status | Change |
+|--------|---------|--------|--------|
+| cd2d24c | 1.316243 | discard | matrix_lr=0.10 from 0.08 (worse) |
+| e5fd554 | 1.360533 | discard | weight_decay=0.1 from 0.2 (much worse) |
+| e8d8067 | 1.309556 | discard | TOP_K=2 from 3 (slightly worse) |
+
+**Experiment branches on origin:**
+- `autoresearch/mar21` — daily branch (current best: val_bpb=1.306817)
+- `autoresearch/mar21-wd1` — val_bpb=1.360533 (discarded)
+- `autoresearch/mar21-topk2` — val_bpb=1.309556 (discarded)
+- `autoresearch/mar21-lr10` — val_bpb=1.316243 (discarded)
+
+**What to try next (good candidates):**
+- aux_loss=0.0 with a safety timeout (previous attempt timed out — try with more conservative setup)
+- embedding_lr adjustment
+- DEPTH=6 or DEPTH=10 (model depth changes)
+- ASPECT_RATIO=16 or 48 (model width changes)
+- N_EXPERTS=8 (more experts)
+- WARMUP_RATIO=0.01 (small warmup instead of none)
+- More radical: try n_embd=512 (ASPECT_RATIO=64) with fewer steps but same time budget
+
+**Aux loss trend:** Reducing aux_loss_weight has been very effective:
+- 0.01 → 1.310673
+- 0.001 → 1.310250
+- 0.0001 → 1.306817 ← current best
+- 0.0 → timed out (no result)
+
+
 ## Setup
 
 To set up a new experiment, work with the user to:
