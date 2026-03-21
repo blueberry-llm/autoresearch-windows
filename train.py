@@ -1040,7 +1040,7 @@ WINDOW_PATTERN = "SSSL"  # sliding window pattern: L=full, S=half context
 N_EXPERTS = 4  # 0 = dense MLP, >0 = MoE with this many experts
 TOP_K = 3  # top_k=3 gave best result previously
 N_SHARED_EXPERTS = 0  # shared experts processed by every token
-AUX_LOSS_WEIGHT = 0.01
+AUX_LOSS_WEIGHT = 0.001
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**19
