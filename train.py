@@ -124,7 +124,7 @@ def _get_gpu_peak_flops(gpu_name):
 def _resolve_gpu_profile(gpu_name, capability, gpu_vram_gb, is_windows):
     name = gpu_name.lower()
     arch = SUPPORTED_CONSUMER_CAPABILITIES.get(capability)
-    min_vram_gb = MIN_SUPPORTED_VRAM_GB_BY_ARCH.get(arch, float("inf"))
+    min_vram_gb = MIN_SUPPORTED_VRAM_GB_BY_ARCH.get(arch or "", float("inf"))
     is_rtx = "rtx" in name
     is_laptop = "laptop" in name
     supported_consumer = (
@@ -151,7 +151,7 @@ def _resolve_gpu_profile(gpu_name, capability, gpu_vram_gb, is_windows):
                 name=mid_tier_name,
                 is_supported_consumer=True,
                 is_compatibility_only=False,
-                train_batch_candidates=(16, 8, 4),
+                train_batch_candidates=(4,),
                 checkpoint_modes=(True,),
                 default_checkpointing=True,
             )
@@ -160,7 +160,7 @@ def _resolve_gpu_profile(gpu_name, capability, gpu_vram_gb, is_windows):
                 name=f"{arch}-16gb",
                 is_supported_consumer=True,
                 is_compatibility_only=False,
-                train_batch_candidates=(32, 16, 8, 4),
+                train_batch_candidates=(16, 8),
                 checkpoint_modes=(False, True),
                 default_checkpointing=False,
             )
@@ -202,7 +202,11 @@ def _compatibility_warning(gpu_name, capability, gpu_vram_gb):
 def _get_autotune_cache_path():
     if platform.system().lower().startswith("win"):
         local_app_data = os.environ.get("LOCALAPPDATA")
-        base = Path(local_app_data) if local_app_data else (Path.home() / "AppData" / "Local")
+        base = (
+            Path(local_app_data)
+            if local_app_data
+            else (Path.home() / "AppData" / "Local")
+        )
     else:
         base = Path.home() / ".cache"
     return base / "autoresearch" / f"{AUTOTUNE_CACHE_VERSION}.json"
@@ -262,7 +266,7 @@ def detect_runtime():
     props = torch.cuda.get_device_properties(0)
     gpu_name = torch.cuda.get_device_name()
     gpu_total_memory_bytes = int(props.total_memory)
-    gpu_vram_gb = gpu_total_memory_bytes / (1024 ** 3)
+    gpu_vram_gb = gpu_total_memory_bytes / (1024**3)
     gpu_cc = torch.cuda.get_device_capability()
     gpu_profile = _resolve_gpu_profile(gpu_name, gpu_cc, gpu_vram_gb, is_windows)
     warning = _compatibility_warning(gpu_name, gpu_cc, gpu_vram_gb)
@@ -329,6 +333,10 @@ class GPTConfig:
     attention_backend: str = "sdpa"
     use_activation_checkpointing: bool = False
     compute_dtype: torch.dtype = torch.bfloat16
+    n_experts: int = 0
+    top_k: int = 2
+    n_shared_experts: int = 0
+    aux_loss_weight: float = 0.01
 
 
 def norm(x):
@@ -364,7 +372,11 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.ve_gate = (
+            nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False)
+            if has_ve(layer_idx, config.n_layer)
+            else None
+        )
         self._mask_cache = {}
 
     def _get_sdpa_mask(self, seq_len, window_size, device):
@@ -390,7 +402,8 @@ class CausalSelfAttention(nn.Module):
 
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
+            assert self.ve_gate is not None
+            gate = 2 * torch.sigmoid(self.ve_gate(x[..., : self.ve_gate_channels]))
             v = v + gate.unsqueeze(-1) * ve
 
         cos, sin = cos_sin
@@ -429,16 +442,131 @@ class MLP(nn.Module):
         return x
 
 
+class MoELayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.n_experts = config.n_experts
+        self.top_k = config.top_k
+        self.n_embd = config.n_embd
+        self.expert_dim = config.n_embd
+        self.n_shared = getattr(config, "n_shared_experts", 0)
+        self.router = nn.Linear(config.n_embd, config.n_experts, bias=False)
+        self.w1 = nn.Parameter(
+            torch.empty(config.n_experts, config.n_embd, self.expert_dim)
+        )
+        self.w2 = nn.Parameter(
+            torch.empty(config.n_experts, self.expert_dim, config.n_embd)
+        )
+        if self.n_shared > 0:
+            self.sw1 = nn.Parameter(
+                torch.empty(self.n_shared, config.n_embd, self.expert_dim)
+            )
+            self.sw2 = nn.Parameter(
+                torch.empty(self.n_shared, self.expert_dim, config.n_embd)
+            )
+            s = 3**0.5 * config.n_embd**-0.5
+            nn.init.uniform_(self.sw1, -s, s)
+            nn.init.zeros_(self.sw2)
+        nn.init.normal_(self.router.weight, mean=0.0, std=0.01)
+        s = 3**0.5 * config.n_embd**-0.5
+        nn.init.uniform_(self.w1, -s, s)
+        nn.init.zeros_(self.w2)
+
+    def forward(self, x):
+        B, T, C = x.size()
+        N = B * T
+        router_logits = self.router(x)
+        router_probs = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+        topk_w, topk_idx = torch.topk(router_probs, self.top_k, dim=-1)
+        topk_w = topk_w / topk_w.sum(dim=-1, keepdim=True)
+
+        flat_idx = topk_idx.reshape(N, self.top_k)
+        flat_w = topk_w.reshape(N, self.top_k).to(x.dtype)
+        flat_x = x.reshape(N, C)
+
+        tokens_per_expert = torch.zeros(self.n_experts, device=x.device)
+        ones = torch.ones(N, self.top_k, device=x.device)
+        tokens_per_expert.scatter_add_(0, flat_idx.reshape(-1), ones.reshape(-1))
+        balance_loss = (
+            self.n_experts * (tokens_per_expert / tokens_per_expert.sum()).pow(2).sum()
+        )
+
+        all_idx = flat_idx.reshape(-1)
+        all_w = flat_w.reshape(-1)
+        tok_ids = (
+            torch.arange(N, device=x.device)
+            .unsqueeze(1)
+            .expand(-1, self.top_k)
+            .reshape(-1)
+        )
+
+        sorted_idx = all_idx.argsort()
+        sorted_tok = tok_ids[sorted_idx]
+        sorted_w = all_w[sorted_idx]
+
+        counts = tokens_per_expert.long()
+        dispatched_x = flat_x[sorted_tok]
+        dispatched_w = sorted_w
+
+        splits = counts.tolist()
+        x_chunks = dispatched_x.split(splits)
+        w_chunks = dispatched_w.split(splits)
+
+        out_chunks = []
+        for e in range(self.n_experts):
+            if splits[e] == 0:
+                continue
+            h = x_chunks[e] @ self.w1[e]
+            h = F.relu(h).square()
+            h = h @ self.w2[e]
+            out_chunks.append(h * w_chunks[e].unsqueeze(-1))
+
+        out_buf = torch.zeros(N, C, device=x.device, dtype=x.dtype)
+        valid_toks = sorted_tok[
+            torch.cat(
+                [
+                    torch.arange(c, device=x.device)
+                    + (counts[:e].sum().item() if e > 0 else 0)
+                    for e, c in enumerate(splits)
+                    if c > 0
+                ]
+            ).long()
+        ]
+        combined = torch.cat(out_chunks, dim=0)
+        out_buf.scatter_add_(0, valid_toks.unsqueeze(-1).expand(-1, C), combined)
+
+        out = out_buf.reshape(B, T, C)
+
+        if self.n_shared > 0:
+            flat_x2 = x.reshape(B * T, C)
+            for i in range(self.n_shared):
+                h = flat_x2 @ self.sw1[i]
+                h = F.relu(h).square()
+                h = h @ self.sw2[i]
+                out = out + h.reshape(B, T, C)
+
+        return out, balance_loss
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.use_moe = config.n_experts > 0
+        if self.use_moe:
+            self.moe = MoELayer(config)
+        else:
+            self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size):
         x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
-        return x
+        if self.use_moe:
+            moe_out, aux_loss = self.moe(norm(x))
+            x = x + moe_out
+            return x, aux_loss
+        else:
+            x = x + self.mlp(norm(x))
+            return x, torch.tensor(0.0, device=x.device)
 
 
 class GPT(nn.Module):
@@ -446,21 +574,28 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         self.window_sizes = self._compute_window_sizes(config)
-        self.transformer = nn.ModuleDict({
-            "wte": nn.Embedding(config.vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
-        })
+        self.transformer = nn.ModuleDict(
+            {
+                "wte": nn.Embedding(config.vocab_size, config.n_embd),
+                "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
+            }
+        )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({
-            str(i): nn.Embedding(config.vocab_size, kv_dim)
-            for i in range(config.n_layer) if has_ve(i, config.n_layer)
-        })
+        self.value_embeds = nn.ModuleDict(
+            {
+                str(i): nn.Embedding(config.vocab_size, kv_dim)
+                for i in range(config.n_layer)
+                if has_ve(i, config.n_layer)
+            }
+        )
         self.rotary_seq_len = config.sequence_len
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim, dtype=config.compute_dtype)
+        cos, sin = self._precompute_rotary_embeddings(
+            self.rotary_seq_len, head_dim, dtype=config.compute_dtype
+        )
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
@@ -469,14 +604,19 @@ class GPT(nn.Module):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         n_embd = self.config.n_embd
-        s = 3 ** 0.5 * n_embd ** -0.5
+        s = 3**0.5 * n_embd**-0.5
         for block in self.transformer.h:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if not block.use_moe:
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            else:
+                torch.nn.init.zeros_(block.moe.w2)
+                torch.nn.init.uniform_(block.moe.w1, -s, s)
+                torch.nn.init.normal_(block.moe.router.weight, mean=0.0, std=0.01)
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
         for ve in self.value_embeds.values():
@@ -495,7 +635,9 @@ class GPT(nn.Module):
         for ve in self.value_embeds.values():
             ve.to(dtype=embed_dtype)
 
-    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None, dtype=torch.bfloat16):
+    def _precompute_rotary_embeddings(
+        self, seq_len, head_dim, base=10000, device=None, dtype=torch.bfloat16
+    ):
         if device is None:
             device = self.transformer.wte.weight.device
         channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
@@ -556,10 +698,19 @@ class GPT(nn.Module):
             "total": total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
-                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+    def setup_optimizer(
+        self,
+        unembedding_lr=0.004,
+        embedding_lr=0.2,
+        matrix_lr=0.02,
+        weight_decay=0.0,
+        adam_betas=(0.8, 0.95),
+        scalar_lr=0.5,
+    ):
         model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
+        all_transformer_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in all_transformer_params if p.ndim == 2]
+        higher_dim_params = [p for p in all_transformer_params if p.ndim > 2]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -567,6 +718,7 @@ class GPT(nn.Module):
         x0_params = [self.x0_lambdas]
         assert len(list(self.parameters())) == (
             len(matrix_params)
+            + len(higher_dim_params)
             + len(embedding_params)
             + len(lm_head_params)
             + len(value_embeds_params)
@@ -576,17 +728,63 @@ class GPT(nn.Module):
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
         param_groups = [
-            dict(kind="adamw", params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind="adamw", params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind="adamw", params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind="adamw", params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind="adamw", params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(
+                kind="adamw",
+                params=lm_head_params,
+                lr=unembedding_lr * dmodel_lr_scale,
+                betas=adam_betas,
+                eps=1e-10,
+                weight_decay=0.0,
+            ),
+            dict(
+                kind="adamw",
+                params=embedding_params,
+                lr=embedding_lr * dmodel_lr_scale,
+                betas=adam_betas,
+                eps=1e-10,
+                weight_decay=0.0,
+            ),
+            dict(
+                kind="adamw",
+                params=value_embeds_params,
+                lr=embedding_lr * dmodel_lr_scale,
+                betas=adam_betas,
+                eps=1e-10,
+                weight_decay=0.0,
+            ),
+            dict(
+                kind="adamw",
+                params=resid_params,
+                lr=scalar_lr * 0.01,
+                betas=adam_betas,
+                eps=1e-10,
+                weight_decay=0.0,
+            ),
+            dict(
+                kind="adamw",
+                params=x0_params,
+                lr=scalar_lr,
+                betas=(0.96, 0.95),
+                eps=1e-10,
+                weight_decay=0.0,
+            ),
         ]
+        if higher_dim_params:
+            param_groups.append(
+                dict(
+                    kind="adamw",
+                    params=higher_dim_params,
+                    lr=matrix_lr * dmodel_lr_scale,
+                    betas=adam_betas,
+                    eps=1e-10,
+                    weight_decay=weight_decay,
+                )
+            )
         muon_group_chunk = 8
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             for ci in range(0, len(group_params), muon_group_chunk):
-                chunk = group_params[ci:ci + muon_group_chunk]
+                chunk = group_params[ci : ci + muon_group_chunk]
                 param_groups.append(
                     dict(
                         kind="muon",
@@ -611,14 +809,19 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)
         x = norm(x)
         x0 = x
+        total_aux_loss = 0.0
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             window_size = self.window_sizes[i]
             if self.config.use_activation_checkpointing:
-                x = torch_checkpoint(block, x, ve, cos_sin, window_size, use_reentrant=False)
+                result = torch_checkpoint(
+                    block, x, ve, cos_sin, window_size, use_reentrant=False
+                )
+                x, aux_loss = result
             else:
-                x = block(x, ve, cos_sin, window_size)
+                x, aux_loss = block(x, ve, cos_sin, window_size)
+            total_aux_loss = total_aux_loss + aux_loss
         x = norm(x)
 
         softcap = 15
@@ -632,6 +835,11 @@ class GPT(nn.Module):
                 ignore_index=-1,
                 reduction=reduction,
             )
+            if self.config.n_experts > 0:
+                loss = (
+                    loss
+                    + self.config.aux_loss_weight * total_aux_loss / self.config.n_layer
+                )
             return loss
         return logits
 
@@ -649,21 +857,34 @@ polar_express_coeffs = [
 ]
 
 
-def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
+def adamw_step_fused(
+    p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t
+):
     p.mul_(1 - lr_t * wd_t)
-    # Keep moments in their own dtype (float32 for fp16 params) to avoid grad^2 underflow.
     g = grad.to(exp_avg.dtype)
-    exp_avg.lerp_(g, 1 - beta1_t)
-    exp_avg_sq.lerp_(g.square(), 1 - beta2_t)
-    bias1 = 1 - beta1_t ** step_t
-    bias2 = 1 - beta2_t ** step_t
+    b1 = beta1_t.to(exp_avg.dtype)
+    b2 = beta2_t.to(exp_avg.dtype)
+    exp_avg.mul_(b1).add_(g, alpha=(1 - b1).item())
+    exp_avg_sq.mul_(b2).add_(g.square(), alpha=(1 - b2).item())
+    bias1 = 1 - beta1_t**step_t
+    bias2 = 1 - beta2_t**step_t
     denom = (exp_avg_sq / bias2).sqrt() + eps_t
     step_size = lr_t / bias1
     p.add_((exp_avg / denom * (-step_size)).to(p.dtype))
 
 
-def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
-                    momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
+def muon_step_fused(
+    stacked_grads,
+    stacked_params,
+    momentum_buffer,
+    second_momentum_buffer,
+    momentum_t,
+    lr_t,
+    wd_t,
+    beta2_t,
+    ns_steps,
+    red_dim,
+):
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
@@ -685,7 +906,9 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
     v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    second_momentum_buffer.lerp_(
+        v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2
+    )
     step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
     scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
@@ -757,10 +980,18 @@ class MuonAdamW(torch.optim.Optimizer):
         num_params = len(params)
         shape, device, dtype = p.shape, p.device, p.dtype
         if "momentum_buffer" not in state:
-            state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
+            state["momentum_buffer"] = torch.zeros(
+                num_params, *shape, dtype=dtype, device=device
+            )
         if "second_momentum_buffer" not in state:
-            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
+            state_shape = (
+                (num_params, shape[-2], 1)
+                if shape[-2] >= shape[-1]
+                else (num_params, 1, shape[-1])
+            )
+            state["second_momentum_buffer"] = torch.zeros(
+                state_shape, dtype=dtype, device=device
+            )
         red_dim = -1 if shape[-2] >= shape[-1] else -2
         stacked_grads = torch.stack([p.grad for p in params])
         stacked_params = torch.stack(params)
@@ -783,12 +1014,17 @@ class MuonAdamW(torch.optim.Optimizer):
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
     @torch.no_grad()
-    def step(self):
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
         for group in self.param_groups:
             if group["kind"] == "adamw":
                 self._step_adamw(group)
             elif group["kind"] == "muon":
                 self._step_muon(group)
+        return loss
 
 
 # ---------------------------------------------------------------------------
@@ -796,15 +1032,21 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 64         # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 128            # target head dimension for attention
-WINDOW_PATTERN = "SSSL"   # sliding window pattern: L=full, S=half context
+ASPECT_RATIO = 32  # model_dim = depth * ASPECT_RATIO
+HEAD_DIM = 128  # target head dimension for attention
+WINDOW_PATTERN = "SSSL"  # sliding window pattern: L=full, S=half context
+
+# MoE
+N_EXPERTS = 4  # 0 = dense MLP, >0 = MoE with this many experts
+TOP_K = 1  # best routing: top-1 beats top-2 and top-3
+N_SHARED_EXPERTS = 0  # shared experts processed by every token
+AUX_LOSS_WEIGHT = 0.01
 
 # Optimization
-TOTAL_BATCH_SIZE = 2 ** 19
+TOTAL_BATCH_SIZE = 2**19
 EMBEDDING_LR = 0.6
 UNEMBEDDING_LR = 0.004
-MATRIX_LR = 0.04
+MATRIX_LR = 0.08
 SCALAR_LR = 0.5
 WEIGHT_DECAY = 0.2
 ADAM_BETAS = (0.8, 0.95)
@@ -821,6 +1063,8 @@ EVAL_BATCH_SIZE = 8
 def build_model_config(depth, vocab_size, runtime, use_activation_checkpointing=None):
     if use_activation_checkpointing is None:
         use_activation_checkpointing = runtime.use_activation_checkpointing
+    if N_EXPERTS > 0:
+        use_activation_checkpointing = False
     base_dim = depth * ASPECT_RATIO
     model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
     num_heads = model_dim // HEAD_DIM
@@ -835,6 +1079,10 @@ def build_model_config(depth, vocab_size, runtime, use_activation_checkpointing=
         attention_backend=runtime.attention_backend,
         use_activation_checkpointing=use_activation_checkpointing,
         compute_dtype=runtime.amp_dtype,
+        n_experts=N_EXPERTS,
+        top_k=TOP_K,
+        n_shared_experts=N_SHARED_EXPERTS,
+        aux_loss_weight=AUX_LOSS_WEIGHT,
     )
 
 
@@ -849,7 +1097,9 @@ def _filter_train_batch_sizes(candidates):
         if batch_size not in deduped:
             deduped.append(batch_size)
     if not deduped:
-        raise RuntimeError("No valid device batch sizes satisfy TOTAL_BATCH_SIZE divisibility.")
+        raise RuntimeError(
+            "No valid device batch sizes satisfy TOTAL_BATCH_SIZE divisibility."
+        )
     return deduped
 
 
@@ -875,7 +1125,9 @@ def _build_eval_batch_candidates(train_batch_size, initial_eval_batch):
     return deduped
 
 
-def _benchmark_train_candidate(runtime, tokenizer, vocab_size, train_batch_size, use_checkpointing):
+def _benchmark_train_candidate(
+    runtime, tokenizer, vocab_size, train_batch_size, use_checkpointing
+):
     config = build_model_config(
         DEPTH,
         vocab_size,
@@ -884,7 +1136,9 @@ def _benchmark_train_candidate(runtime, tokenizer, vocab_size, train_batch_size,
     )
     tokens_per_fwdbwd = train_batch_size * MAX_SEQ_LEN
     grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
-    autocast_ctx = torch.amp.autocast(device_type=runtime.device_type, dtype=runtime.amp_dtype)
+    autocast_ctx = torch.amp.autocast(
+        device_type=runtime.device_type, dtype=runtime.amp_dtype
+    )
 
     model = None
     optimizer = None
@@ -973,7 +1227,9 @@ def _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates):
         if isinstance(cached, dict):
             cached_batch_size = cached.get("train_batch_size")
             cached_checkpointing = cached.get("use_activation_checkpointing")
-            if isinstance(cached_batch_size, int) and isinstance(cached_checkpointing, bool):
+            if isinstance(cached_batch_size, int) and isinstance(
+                cached_checkpointing, bool
+            ):
                 cached_candidate = (cached_batch_size, cached_checkpointing)
                 if cached_candidate in train_candidates:
                     print(
@@ -988,7 +1244,9 @@ def _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates):
     best_peak_memory = 0
     for train_batch_size, use_checkpointing in train_candidates:
         ckpt_label = "on" if use_checkpointing else "off"
-        print(f"Autotune probe: train_batch_size={train_batch_size}, checkpointing={ckpt_label}")
+        print(
+            f"Autotune probe: train_batch_size={train_batch_size}, checkpointing={ckpt_label}"
+        )
         result = _benchmark_train_candidate(
             runtime=runtime,
             tokenizer=tokenizer,
@@ -1000,14 +1258,18 @@ def _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates):
             print("  rejected (OOM, runtime error, or >90% VRAM use)")
             continue
         tok_per_sec, peak_memory = result
-        print(f"  accepted: tok/sec={tok_per_sec:,.0f}, peak_vram_mb={peak_memory / 1024 / 1024:.1f}")
+        print(
+            f"  accepted: tok/sec={tok_per_sec:,.0f}, peak_vram_mb={peak_memory / 1024 / 1024:.1f}"
+        )
         if tok_per_sec > best_tok_per_sec:
             best_tok_per_sec = tok_per_sec
             best_candidate = (train_batch_size, use_checkpointing)
             best_peak_memory = peak_memory
 
     if best_candidate is None:
-        print("Autotune could not find a viable candidate; using default fallback ordering.")
+        print(
+            "Autotune could not find a viable candidate; using default fallback ordering."
+        )
         return None
 
     cache_entries[cache_key] = {
@@ -1028,7 +1290,9 @@ def _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates):
 def _prioritize_autotuned_candidate(train_candidates, autotuned_candidate):
     if autotuned_candidate is None or autotuned_candidate not in train_candidates:
         return train_candidates
-    return [autotuned_candidate] + [c for c in train_candidates if c != autotuned_candidate]
+    return [autotuned_candidate] + [
+        c for c in train_candidates if c != autotuned_candidate
+    ]
 
 
 def _configure_step_kernels(runtime):
@@ -1056,7 +1320,9 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
     torch.cuda.manual_seed(42)
     torch.set_float32_matmul_precision("high")
 
-    autocast_ctx = torch.amp.autocast(device_type=runtime.device_type, dtype=runtime.amp_dtype)
+    autocast_ctx = torch.amp.autocast(
+        device_type=runtime.device_type, dtype=runtime.amp_dtype
+    )
 
     with torch.device("meta"):
         model = GPT(config)
@@ -1118,6 +1384,7 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
     smooth_train_loss = 0.0
     total_training_time = 0.0
     step = 0
+    train_loss = torch.tensor(0.0)
 
     while True:
         torch.cuda.synchronize()
@@ -1158,14 +1425,20 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         pct_done = 100 * progress
         tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
         if runtime.gpu_peak_flops:
-            mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / runtime.gpu_peak_flops
+            mfu = (
+                100
+                * num_flops_per_token
+                * TOTAL_BATCH_SIZE
+                / dt
+                / runtime.gpu_peak_flops
+            )
             mfu_text = f"{mfu:.1f}%"
         else:
             mfu_text = "n/a"
         remaining = max(0, target_training_seconds - total_training_time)
         print(
             f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | "
-            f"lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | "
+            f"lrm: {lrm:.2f} | dt: {dt * 1000:.0f}ms | tok/sec: {tok_per_sec:,} | "
             f"mfu: {mfu_text} | epoch: {epoch} | remaining: {remaining:.0f}s    ",
             end="",
             flush=True,
@@ -1200,7 +1473,11 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
 
 def _save_pre_eval_checkpoint(model):
     try:
-        state_dict = model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict()
+        state_dict = (
+            model._orig_mod.state_dict()
+            if hasattr(model, "_orig_mod")
+            else model.state_dict()
+        )
         torch.save(state_dict, "checkpoint_pre_eval.pt")
         print("Saved checkpoint_pre_eval.pt")
     except Exception as exc:  # pragma: no cover
@@ -1216,8 +1493,17 @@ def _restore_gc_after_attempt():
 
 def main():
     parser = argparse.ArgumentParser(description="Autoresearch training script")
-    parser.add_argument("--smoke-test", action="store_true", help="Run a short train/eval pass for validation.")
-    parser.add_argument("--dataset", choices=DATASET_CHOICES, default=None, help="Optional dataset override.")
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Run a short train/eval pass for validation.",
+    )
+    parser.add_argument(
+        "--dataset",
+        choices=DATASET_CHOICES,
+        default=None,
+        help="Optional dataset override.",
+    )
     args = parser.parse_args()
 
     runtime = detect_runtime()
@@ -1225,7 +1511,9 @@ def main():
     print(f"GPU VRAM: {runtime.gpu_vram_gb:.1f} GB")
     print(f"GPU CC: {runtime.gpu_cc[0]}.{runtime.gpu_cc[1]}")
     print(f"GPU profile: {runtime.gpu_profile.name}")
-    print(f"Consumer matrix support: {'yes' if runtime.gpu_profile.is_supported_consumer else 'compatibility path'}")
+    print(
+        f"Consumer matrix support: {'yes' if runtime.gpu_profile.is_supported_consumer else 'compatibility path'}"
+    )
     print(f"TF32: {'enabled' if runtime.tf32_enabled else 'disabled'}")
     print(f"AMP dtype: {runtime.amp_dtype}")
 
@@ -1238,8 +1526,12 @@ def main():
     _configure_step_kernels(runtime)
 
     train_candidates = _build_train_candidates(runtime)
-    autotuned_candidate = _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates)
-    train_candidates = _prioritize_autotuned_candidate(train_candidates, autotuned_candidate)
+    autotuned_candidate = _autotune_train_candidate(
+        runtime, tokenizer, vocab_size, train_candidates
+    )
+    train_candidates = _prioritize_autotuned_candidate(
+        train_candidates, autotuned_candidate
+    )
 
     print(f"Attention backend: {runtime.attention_backend}")
     print(f"torch.compile: {'enabled' if USE_COMPILE else 'disabled'}")
@@ -1288,19 +1580,28 @@ def main():
         print("FAIL: training failed for all batch size candidates.")
         return 1
 
+    assert chosen_train_batch is not None
     model = result["model"]
     _save_pre_eval_checkpoint(model)
     model.eval()
 
-    eval_tokens = max(MAX_SEQ_LEN * chosen_train_batch * 2, 8192) if args.smoke_test else EVAL_TOKENS
+    eval_tokens = (
+        max(MAX_SEQ_LEN * chosen_train_batch * 2, 8192)
+        if args.smoke_test
+        else EVAL_TOKENS
+    )
     val_bpb = None
     chosen_eval_batch = None
     initial_eval_batch = min(chosen_train_batch, runtime.gpu_profile.eval_batch_cap)
-    eval_candidates = _build_eval_batch_candidates(chosen_train_batch, initial_eval_batch)
+    eval_candidates = _build_eval_batch_candidates(
+        chosen_train_batch, initial_eval_batch
+    )
     for eval_batch_size in eval_candidates:
         try:
             torch.cuda.empty_cache()
-            with torch.amp.autocast(device_type=runtime.device_type, dtype=runtime.amp_dtype):
+            with torch.amp.autocast(
+                device_type=runtime.device_type, dtype=runtime.amp_dtype
+            ):
                 val_bpb = evaluate_bpb(
                     model,
                     tokenizer,
@@ -1356,7 +1657,9 @@ def main():
     print(f"dataset:          {tokenizer.dataset}")
     print(f"train_batch_size: {chosen_train_batch}")
     print(f"eval_batch_size:  {chosen_eval_batch}")
-    print(f"activation_checkpointing: {'enabled' if chosen_checkpointing else 'disabled'}")
+    print(
+        f"activation_checkpointing: {'enabled' if chosen_checkpointing else 'disabled'}"
+    )
     if args.smoke_test:
         print("smoke_test:       true")
     return 0

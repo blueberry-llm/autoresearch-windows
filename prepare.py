@@ -28,7 +28,7 @@ import torch
 # ---------------------------------------------------------------------------
 
 MAX_SEQ_LEN = 2048  # context length
-TIME_BUDGET = 1800  # training time budget in seconds (30 minutes)
+TIME_BUDGET = 2400  # training time budget in seconds (40 minutes)
 EVAL_TOKENS = 40 * 524288  # number of tokens for validation eval
 VOCAB_SIZE = 16384
 
@@ -73,9 +73,9 @@ DATASET_CONFIGS = {
         "filename": "ultrafineweb_0.parquet",
         "url": "https://huggingface.co/api/datasets/CrowdMind/ultrafineweb_dolma_shuffled/parquet/default/train/0.parquet",
         "splits": {
-            "test": (0, 10_000),
-            "val": (10_000, 20_000),
-            "train": (20_000, None),
+            "test": (0, 2_000),
+            "val": (2_000, 4_000),
+            "train": (4_000, None),
         },
     },
     "tinystories": {
@@ -393,6 +393,7 @@ class Tokenizer:
         return self.bos_token_id
 
     def encode(self, text, prepend=None, num_threads=8):
+        prepend_id: int | None = None
         if prepend is not None:
             prepend_id = (
                 prepend
@@ -401,11 +402,11 @@ class Tokenizer:
             )
         if isinstance(text, str):
             ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
+            if prepend_id is not None:
                 ids.insert(0, prepend_id)
         elif isinstance(text, list):
             ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
+            if prepend_id is not None:
                 for row in ids:
                     row.insert(0, prepend_id)
         else:
@@ -515,7 +516,7 @@ def make_dataloader(
 
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
-        if use_cuda:
+        if use_cuda and gpu_buffer is not None:
             gpu_buffer.copy_(cpu_buffer, non_blocking=True)
         yield inputs, targets, epoch
 
