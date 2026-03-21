@@ -18,4 +18,5 @@ dc0de1b	1.319774	3.4	keep	MoE top_k=3: 31.5M params, ~295 steps, tied best
 1645919	1.332538	3.4	discard	MoE 4 experts + 1 shared: 32.5M params, 319 steps, shared hurts
 ---	3/21 experiments	---	---
 d232fbb	1.310673	3.4	keep	MoE top_k=3, 31.5M params, 322 steps, new best
-4a846c9	1.310250	3.4	keep	MoE aux_loss=0.001 (from top_k=3), 321 steps, NEW BEST
+4a846c9	1.310250	3.4	keep	MoE aux_loss=0.001 (from top_k=3), 321 steps, previous best
+6bc3ba8	1.306817	3.4	keep	MoE aux_loss=0.0001, 322 steps, NEW BEST
