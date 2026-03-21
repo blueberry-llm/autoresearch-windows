@@ -16,3 +16,5 @@ fecaf45	1.449501	3.3	discard	MoE HEAD_DIM=32: 31.5M params, worse with small hea
 43d3e0e	1.320155	3.3	keep	MoE top_k=1: 31.5M params, ~291 steps, best routing config
 dc0de1b	1.319774	3.4	keep	MoE top_k=3: 31.5M params, ~295 steps, tied best
 1645919	1.332538	3.4	discard	MoE 4 experts + 1 shared: 32.5M params, 319 steps, shared hurts
+---	3/21 experiments	---	---
+d232fbb	1.310673	3.4	keep	MoE top_k=3, 31.5M params, 322 steps, NEW BEST
